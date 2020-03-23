@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -13,16 +14,22 @@ const (
 )
 
 var (
+	_cellId   uint64
 	_timeline TimeLine
 	_pool     TimerSets
 )
+
+type LockMap struct {
+	sync.Mutex
+	v map[TimerID]*TimerCell
+}
 
 // 每个timer的唯一标识
 type TimerID uint64
 
 type TimeLine struct {
-	m sync.RWMutex
-	v map[TimeIndex]*TimeSlice
+	v     map[TimeIndex]*TimeSlice
+	dirty LockMap
 }
 
 // 所有timer的集合
@@ -49,78 +56,129 @@ func (l TimerList) Swap(i, j int) {
 
 // 每一个TimeIndex下的内容
 type TimeSlice struct {
-	sync.Mutex
 	index TimeIndex
 	// 无序timer
-	disorder map[TimerID]*TimerCell
-	// 有序timer
-	order TimerList
-	// 是否已经经过了排序
-	sorted bool
+	v map[TimerID]*TimerCell
 }
 
 type TimerCell struct {
-	id        uint64
-	deadline  time.Time
-	discarded bool
-	repeat    bool
-	interval  time.Duration
-	ext       interface{}
+	id       TimerID
+	deadline time.Time
+	index    TimeIndex
+	repeat   bool
+	interval time.Duration
+	ext      interface{}
 }
 
-func (t *TimeSlice) Sort() {
-	l := make(TimerList, 0, len(t.disorder))
-	for _, v := range t.disorder {
-		l = append(l, v)
+// TODO:  init 部分一定要记得处理 _cellId 的初始值, 从当前 timers 中找到最大值+1
+
+func NewTimerCell(deadline int64, repeat bool, interval int, ext interface{}) *TimerCell {
+	return &TimerCell{
+		id:       TimerID(atomic.AddUint64(&_cellId, 1)),
+		deadline: time.Unix(deadline, 0),
+		index:    TimeIndex(deadline / TimelineRadix),
+		repeat:   repeat,
+		interval: time.Duration(interval) * time.Second,
+		ext:      ext,
+	}
+}
+
+func (t *TimeSlice) sort() TimerList {
+	// TODO: 这里可以不用新生成一个 切片, 而是用一个既有的
+	l := make(TimerList, 0, len(t.v))
+	for _, cell := range t.v {
+		l = append(l, cell)
 	}
 	sort.Sort(l)
-	t.sorted = true
+	return l
 }
 
-func (t *TimeLine) GetSlice(index TimeIndex) (slice *TimeSlice, ok bool) {
-	t.m.Lock()
-	defer t.m.Unlock()
+func (t *TimeLine) pushDirty(cell *TimerCell) {
+	t.dirty.Lock()
+	defer t.dirty.Unlock()
+	if t.dirty.v == nil {
+		t.dirty.v = make(map[TimerID]*TimerCell)
+	}
+	t.dirty.v[cell.id] = cell
+}
+
+func (t *TimeLine) popDirty(out map[TimerID]*TimerCell) {
+	t.dirty.Lock()
+	r := t.dirty.v
+	t.dirty.v = nil
+	t.dirty.Unlock()
+	for k, v := range r {
+		out[k] = v
+	}
+}
+
+func (t *TimeLine) GetSliceAndDelete(index TimeIndex) (slice *TimeSlice, ok bool) {
 	slice, ok = t.v[index]
+	if ok {
+		delete(t.v, index)
+	}
 	return
 }
 
-func (t *TimeLine) AddTimer(cell *TimerCell) bool {
-	t.m.Lock()
-	defer t.m.Unlock()
-	index := TimeIndex(cell.deadline.Unix() / TimelineRadix)
-	nowIndex := TimeIndex(time.Now().Unix() / TimelineRadix)
-	if index <= nowIndex {
+func (t *TimeLine) addTimer(cell *TimerCell) bool {
+	if cell.deadline.Before(time.Now().Add(5 * time.Second)) {
 		return false
 	}
-	slice, ok := t.v[index]
+	t.pushDirty(cell)
+	return true
+}
+
+// 将代理放入到对应的timeslice中
+func (t *TimeLine) putLine(cell *TimerCell) {
+	slice, ok := t.v[cell.index]
 	if !ok {
 		slice = &TimeSlice{}
+		t.v[cell.index] = slice
 	}
-	return slice
+	slice.v[cell.id] = cell
+}
+
+func merge(index TimeIndex, dirty map[TimerID]*TimerCell) {
+	for id, cell := range dirty {
+		if cell.deadline.Before(time.Now()) {
+			emit(cell)
+			delete(dirty, id)
+			continue
+		}
+		if cell.index > index {
+			_timeline.putLine(cell)
+		}
+		// 注意 cell.index == index 时不要处理, 留着在 before 那里去触发
+		// 因为在两个 index 临界的时候, 很容易把 timer 插入到不会再处理的 slice 中去
+	}
 }
 
 func ant() {
-	var slice *TimeSlice
+	dirty := make(map[TimerID]*TimerCell)
 	for {
 		index := TimeIndex(time.Now().Unix() / TimelineRadix)
-		if slice == nil {
-			v, ok := _timeline.GetSliceAndDelete(index)
-			if !ok {
-				time.Sleep(time.Millisecond)
-				continue
+		slice, ok := _timeline.v[index]
+		if ok {
+			l := slice.sort()
+			for TimeIndex(time.Now().Unix()/TimelineRadix) < index || len(l) > 0 {
+				for i, cell := range l {
+					if cell.deadline.Before(time.Now()) {
+						emit(cell)
+					} else {
+						l = l[i:]
+						break
+					}
+				}
+				_timeline.popDirty(dirty)
+				merge(index, dirty)
 			}
-			slice = v
 		}
-		if !slice.sorted {
-			slice.Sort()
-		}
-		newstart = 0
-		for i, t := range slice.order {
-			if t.deadline.Before(time.Now()) {
-				// TODO: 发送到到期ringbuffer去
-			}
-		}
+		time.Sleep(time.Millisecond)
 	}
+}
+
+func emit(cell *TimerCell) {
+	// TODO: 将到期 cell 发送到 ringbuff 等待读取
 }
 
 func main() {
