@@ -179,6 +179,10 @@ func ant() {
 	}
 }
 
+func syncdb(cell *TimerCell) {
+	// 同步到持久化部分, 若出现问题及时panic
+}
+
 func emit(cell *TimerCell) {
 	// TODO: 将到期 cell 发送到 ringbuff 等待读取
 }
