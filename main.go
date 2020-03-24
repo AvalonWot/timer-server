@@ -112,7 +112,7 @@ func (t *TimeLine) popDirty(out map[TimerID]*TimerCell) {
 	}
 }
 
-func (t *TimeLine) GetSliceAndDelete(index TimeIndex) (slice *TimeSlice, ok bool) {
+func (t *TimeLine) getSliceAndDelete(index TimeIndex) (slice *TimeSlice, ok bool) {
 	slice, ok = t.v[index]
 	if ok {
 		delete(t.v, index)
@@ -138,6 +138,7 @@ func (t *TimeLine) putLine(cell *TimerCell) {
 	slice.v[cell.id] = cell
 }
 
+// 将添加进来的timer(在dirty中的),合并到对应的slice中
 func merge(index TimeIndex, dirty map[TimerID]*TimerCell) {
 	for id, cell := range dirty {
 		if cell.deadline.Before(time.Now()) {
@@ -147,6 +148,7 @@ func merge(index TimeIndex, dirty map[TimerID]*TimerCell) {
 		}
 		if cell.index > index {
 			_timeline.putLine(cell)
+			delete(dirty, id)
 		}
 		// 注意 cell.index == index 时不要处理, 留着在 before 那里去触发
 		// 因为在两个 index 临界的时候, 很容易把 timer 插入到不会再处理的 slice 中去
@@ -157,7 +159,7 @@ func ant() {
 	dirty := make(map[TimerID]*TimerCell)
 	for {
 		index := TimeIndex(time.Now().Unix() / TimelineRadix)
-		slice, ok := _timeline.v[index]
+		slice, ok := _timeline.getSliceAndDelete(index)
 		if ok {
 			l := slice.sort()
 			for TimeIndex(time.Now().Unix()/TimelineRadix) < index || len(l) > 0 {
