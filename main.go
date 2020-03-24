@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"runtime"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -157,8 +158,8 @@ func merge(index TimeIndex, dirty map[TimerID]*TimerCell) {
 
 func ant() {
 	dirty := make(map[TimerID]*TimerCell)
+	index := TimeIndex(time.Now().Unix() / TimelineRadix)
 	for {
-		index := TimeIndex(time.Now().Unix() / TimelineRadix)
 		slice, ok := _timeline.getSliceAndDelete(index)
 		if ok {
 			l := slice.sort()
@@ -173,9 +174,18 @@ func ant() {
 				}
 				_timeline.popDirty(dirty)
 				merge(index, dirty)
+				runtime.Gosched()
+			}
+		} else {
+			for TimeIndex(time.Now().Unix()/TimelineRadix) < index {
+				_timeline.popDirty(dirty)
+				merge(index, dirty)
+				time.Sleep(100 * time.Millisecond)
 			}
 		}
-		time.Sleep(time.Millisecond)
+		runtime.Gosched()
+		// 保证每一个slice都被遍历一次
+		index++
 	}
 }
 
