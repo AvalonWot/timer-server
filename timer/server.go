@@ -1,8 +1,10 @@
 package timer
 
 import (
+	"log"
 	"runtime"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -30,6 +32,7 @@ type TimeLine struct {
 
 // 所有timer的集合
 type TimerSets struct {
+	m    sync.RWMutex
 	sets map[TimerID]*TimerCell
 }
 
@@ -61,8 +64,6 @@ type TimerCell struct {
 	id       TimerID
 	deadline time.Time
 	index    TimeIndex
-	repeat   bool
-	interval time.Duration
 	ext      interface{}
 }
 
@@ -76,15 +77,64 @@ func Run() {
 
 // TODO:  init 部分一定要记得处理 _cellId 的初始值, 从当前 timers 中找到最大值+1
 
-func NewTimerCell(deadline int64, repeat bool, interval int, ext interface{}) *TimerCell {
-	return &TimerCell{
+// 添加计时器
+func AddTimer(deadline int64, ext interface{}) (id TimerID, ok bool) {
+	d := time.Unix(deadline, 0)
+	if d.Before(time.Now()) {
+		return TimerID(0), false
+	}
+	cell := &TimerCell{
 		id:       TimerID(atomic.AddUint64(&_cellId, 1)),
 		deadline: time.Unix(deadline, 0),
 		index:    TimeIndex(deadline / TimelineRadix),
-		repeat:   repeat,
-		interval: time.Duration(interval) * time.Second,
 		ext:      ext,
 	}
+	if !_pool.add(cell) {
+		log.Printf("[ERR] 添加计时器 %d 失败\n", cell.id)
+		return TimerID(0), false
+	}
+	log.Printf("[INFO] 添加计时器 %d\n", cell.id)
+	_timeline.pushDirty(cell)
+	return cell.id, true
+}
+
+// 查找计时器是否存在, 若存在折该计时器还未触发
+func IsTimerAlive(id TimerID) bool {
+	_, ok := _pool.find(id)
+	return ok
+}
+
+// 移除计时器
+func RemoveTimer(id TimerID) bool {
+	return _pool.remove(id)
+}
+
+func (s *TimerSets) add(cell *TimerCell) bool {
+	s.m.Lock()
+	defer s.m.Unlock()
+	if _, ok := s.sets[cell.id]; ok {
+		log.Printf("[ERR] %d 计时器已经存在\n", cell.id)
+		return false
+	}
+	s.sets[cell.id] = cell
+	return true
+}
+
+func (s *TimerSets) remove(id TimerID) bool {
+	s.m.Lock()
+	defer s.m.Unlock()
+	if _, ok := s.sets[id]; ok {
+		delete(s.sets, id)
+		return true
+	}
+	return false
+}
+
+func (s *TimerSets) find(id TimerID) (cell *TimerCell, ok bool) {
+	s.m.RLock()
+	defer s.m.RUnlock()
+	cell, ok = s.sets[id]
+	return
 }
 
 func (t *TimeSlice) sort() TimerList {
@@ -123,19 +173,11 @@ func (t *TimeLine) getSliceAndDelete(index TimeIndex) (slice *TimeSlice, ok bool
 	return
 }
 
-func (t *TimeLine) addTimer(cell *TimerCell) bool {
-	if cell.deadline.Before(time.Now().Add(5 * time.Second)) {
-		return false
-	}
-	t.pushDirty(cell)
-	return true
-}
-
 // 将代理放入到对应的timeslice中
 func (t *TimeLine) putLine(cell *TimerCell) {
 	slice, ok := t.v[cell.index]
 	if !ok {
-		slice = &TimeSlice{}
+		slice = &TimeSlice{cell.index, make(map[TimerID]*TimerCell)}
 		t.v[cell.index] = slice
 	}
 	slice.v[cell.id] = cell
