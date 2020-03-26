@@ -9,17 +9,20 @@ import (
 	"time"
 
 	"example.com/timer-server/queue"
+	"github.com/gomodule/redigo/redis"
 )
 
 const (
 	// 在时间线上划分的间隔的基数, 单位是秒
-	TimelineRadix = 2 * 60
+	TimelineRadix   = 2 * 60
+	RedisServerAddr = "192.168.31.158:6379"
 )
 
 var (
 	_cellId   uint64
 	_timeline TimeLine
 	_pool     TimerSets
+	_redis    *redis.Pool
 )
 
 // 每个timer的唯一标识
@@ -61,24 +64,78 @@ type TimeSlice struct {
 }
 
 type TimerCell struct {
-	id       TimerID
-	deadline time.Time
-	index    TimeIndex
-	ext      interface{}
+	id       TimerID   `redis:"id"`
+	deadline time.Time `redis:"deadline"`
+	index    TimeIndex `redis:"index"`
+	value    string    `redis:"value"`
 }
 
 func init() {
 	_timeline.dirty = queue.NewQueue(1024 * 1024)
+	_redis = &redis.Pool{
+		MaxIdle:     3,
+		IdleTimeout: 240 * time.Second,
+		Wait:        true,
+		Dial: func() (redis.Conn, error) {
+			c, err := redis.Dial("tcp", RedisServerAddr, redis.DialConnectTimeout(5*time.Second))
+			if err != nil {
+				return c, err
+			}
+			return c, err
+		},
+	}
+	recovery()
 }
 
-func Run() {
+func recovery() error {
+	c := _redis.Get()
+	defer c.Close()
+	cache := make(map[TimerID]*TimerCell, 1024*1024)
+	iter := "0"
+	for {
+		reply, err := redis.Values(redis.DoWithTimeout(c, 5*time.Second, "SCAN", iter))
+		if err != nil {
+			return err
+		}
+		iter, err = redis.String(reply[0], nil)
+		if err != nil {
+			return err
+		}
+		var ids []interface{}
+		ids, err = redis.Values(reply[1], nil)
+		if err != nil {
+			return err
+		}
+		for _, id := range ids {
+			v, err := redis.Values(c.Do("HGETALL", id))
+			if err != nil {
+				return err
+			}
+			cell := &TimerCell{}
+			if err := redis.ScanStruct(v, cell); err != nil {
+				return err
+			}
+			cache[cell.id] = cell
+		}
+		if iter == "0" {
+			break
+		}
+	}
+	log.Printf("[INFO] 读取到timer个数: %d", len(cache))
 	go ant()
+	go func(vs map[TimerID]*TimerCell) {
+		for _, cell := range vs {
+			_timeline.pushDirty(cell)
+		}
+		log.Printf("所有timer导入完成")
+	}(cache)
+	return nil
 }
 
 // TODO:  init 部分一定要记得处理 _cellId 的初始值, 从当前 timers 中找到最大值+1
 
 // 添加计时器
-func AddTimer(deadline int64, ext interface{}) (id TimerID, ok bool) {
+func AddTimer(deadline int64, value string) (id TimerID, ok bool) {
 	d := time.Unix(deadline, 0)
 	if d.Before(time.Now()) {
 		return TimerID(0), false
@@ -87,7 +144,7 @@ func AddTimer(deadline int64, ext interface{}) (id TimerID, ok bool) {
 		id:       TimerID(atomic.AddUint64(&_cellId, 1)),
 		deadline: time.Unix(deadline, 0),
 		index:    TimeIndex(deadline / TimelineRadix),
-		ext:      ext,
+		value:    value,
 	}
 	if !_pool.add(cell) {
 		log.Printf("[ERR] 添加计时器 %d 失败\n", cell.id)
