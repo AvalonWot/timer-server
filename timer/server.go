@@ -14,8 +14,7 @@ import (
 
 const (
 	// 在时间线上划分的间隔的基数, 单位是秒
-	TimelineRadix   = 2 * 60
-	RedisServerAddr = "192.168.31.158:6379"
+	TimelineRadix = 2 * 60
 )
 
 var (
@@ -71,14 +70,14 @@ type TimerCell struct {
 	value    string    `redis:"value"`
 }
 
-func init() {
+func Init(redisAddr string) {
 	_timeline.dirty = queue.NewQueue(1024 * 1024)
 	_redis = &redis.Pool{
 		MaxIdle:     3,
 		IdleTimeout: 240 * time.Second,
 		Wait:        true,
 		Dial: func() (redis.Conn, error) {
-			c, err := redis.Dial("tcp", RedisServerAddr, redis.DialConnectTimeout(5*time.Second))
+			c, err := redis.Dial("tcp", redisAddr, redis.DialConnectTimeout(5*time.Second))
 			if err != nil {
 				return c, err
 			}
@@ -320,25 +319,22 @@ func dbremoves(cells []*TimerCell) {
 }
 
 // 添加计时器
-func AddTimer(deadline int64, value string) (id TimerID, ok bool) {
-	d := time.Unix(deadline, 0)
-	if d.Before(time.Now()) {
-		return TimerID(0), false
-	}
+func AddTimer(deadline int64, value string) TimerID {
 	cell := &TimerCell{
-		id:       TimerID(atomic.AddUint64(&_cellId, 1)),
 		deadline: time.Unix(deadline, 0),
 		index:    TimeIndex(deadline / TimelineRadix),
 		value:    value,
 	}
-	if !_pool.add(cell) {
-		log.Printf("[ERR] 添加计时器 %d 失败\n", cell.id)
-		return TimerID(0), false
+	for {
+		cell.id = TimerID(atomic.AddUint64(&_cellId, 1))
+		if _pool.add(cell) {
+			break
+		}
 	}
 	dbadd(cell)
 	log.Printf("[INFO] 添加计时器 %d\n", cell.id)
 	_timeline.pushDirty(cell)
-	return cell.id, true
+	return cell.id
 }
 
 // 查找计时器是否存在, 若存在折该计时器还未触发
