@@ -64,10 +64,15 @@ type TimeSlice struct {
 }
 
 type TimerCell struct {
-	id       TimerID   `redis:"id"`
-	deadline time.Time `redis:"deadline"`
-	index    TimeIndex `redis:"index"`
-	value    string    `redis:"value"`
+	id       TimerID
+	deadline time.Time
+	index    TimeIndex
+	value    string
+}
+
+type dbCell struct {
+	deadline int64  `redis:"deadline"`
+	value    string `redis:"value"`
 }
 
 func Init(redisAddr string) {
@@ -106,14 +111,25 @@ func recovery() error {
 		if err != nil {
 			return err
 		}
-		for _, id := range ids {
-			v, err := redis.Values(c.Do("HGETALL", id))
+		for _, mid := range ids {
+			id, err := redis.Uint64(mid, nil)
+			if err != nil {
+				log.Printf("[ERR] 无法解析db的id为TimerID: %v", mid)
+				return err
+			}
+			v, err := redis.Values(c.Do("HGETALL", mid))
 			if err != nil {
 				return err
 			}
-			cell := &TimerCell{}
-			if err := redis.ScanStruct(v, cell); err != nil {
+			var dbc dbCell
+			if err := redis.ScanStruct(v, &dbc); err != nil {
 				return err
+			}
+			cell := &TimerCell{
+				id:       TimerID(id),
+				deadline: time.Unix(dbc.deadline, 0),
+				index:    TimeIndex(dbc.deadline / TimelineRadix),
+				value:    dbc.value,
 			}
 			// 选取当前已有最大的timerid作为之后新timer的计数基准
 			if uint64(cell.id) > _cellId {
@@ -281,8 +297,11 @@ func dbadd(cell *TimerCell) bool {
 	// FIXME: 实现原子操作: 不存在才添加
 	c := _redis.Get()
 	defer c.Close()
-
-	if _, err := c.Do("HMSET", redis.Args{}.Add(cell.id).AddFlat(cell)...); err != nil {
+	dbc := &dbCell{
+		deadline: cell.deadline.Unix(),
+		value:    cell.value,
+	}
+	if _, err := c.Do("HMSET", redis.Args{}.Add(cell.id).AddFlat(dbc)...); err != nil {
 		log.Panicf("写入redis发生错误: %v", err)
 	}
 	return true
