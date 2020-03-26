@@ -114,8 +114,8 @@ func (q *EsQueue) Puts(values []interface{}) (puts, quantity uint32) {
 	var putPos, putPosNew, getPos, posCnt, putCnt uint32
 	capMod := q.capMod
 
-	getPos = atomic.LoadUint32(&q.getPos)
 	putPos = atomic.LoadUint32(&q.putPos)
+	getPos = atomic.LoadUint32(&q.getPos)
 
 	if putPos >= getPos {
 		posCnt = putPos - getPos
@@ -204,8 +204,8 @@ func (q *EsQueue) Gets(values []interface{}) (gets, quantity uint32) {
 	var putPos, getPos, getPosNew, posCnt, getCnt uint32
 	capMod := q.capMod
 
-	putPos = atomic.LoadUint32(&q.putPos)
 	getPos = atomic.LoadUint32(&q.getPos)
+	putPos = atomic.LoadUint32(&q.putPos)
 
 	if putPos >= getPos {
 		posCnt = putPos - getPos
