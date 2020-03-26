@@ -23,6 +23,7 @@ var (
 	_timeline TimeLine
 	_pool     TimerSets
 	_redis    *redis.Pool
+	_expired  = queue.NewQueue(1024 * 1024)
 )
 
 // 每个timer的唯一标识
@@ -115,6 +116,10 @@ func recovery() error {
 			if err := redis.ScanStruct(v, cell); err != nil {
 				return err
 			}
+			// 选取当前已有最大的timerid作为之后新timer的计数基准
+			if uint64(cell.id) > _cellId {
+				_cellId = uint64(cell.id)
+			}
 			cache[cell.id] = cell
 		}
 		if iter == "0" {
@@ -133,38 +138,6 @@ func recovery() error {
 }
 
 // TODO:  init 部分一定要记得处理 _cellId 的初始值, 从当前 timers 中找到最大值+1
-
-// 添加计时器
-func AddTimer(deadline int64, value string) (id TimerID, ok bool) {
-	d := time.Unix(deadline, 0)
-	if d.Before(time.Now()) {
-		return TimerID(0), false
-	}
-	cell := &TimerCell{
-		id:       TimerID(atomic.AddUint64(&_cellId, 1)),
-		deadline: time.Unix(deadline, 0),
-		index:    TimeIndex(deadline / TimelineRadix),
-		value:    value,
-	}
-	if !_pool.add(cell) {
-		log.Printf("[ERR] 添加计时器 %d 失败\n", cell.id)
-		return TimerID(0), false
-	}
-	log.Printf("[INFO] 添加计时器 %d\n", cell.id)
-	_timeline.pushDirty(cell)
-	return cell.id, true
-}
-
-// 查找计时器是否存在, 若存在折该计时器还未触发
-func IsTimerAlive(id TimerID) bool {
-	_, ok := _pool.find(id)
-	return ok
-}
-
-// 移除计时器
-func RemoveTimer(id TimerID) bool {
-	return _pool.remove(id)
-}
 
 func (s *TimerSets) add(cell *TimerCell) bool {
 	s.m.Lock()
@@ -185,6 +158,17 @@ func (s *TimerSets) remove(id TimerID) bool {
 		return true
 	}
 	return false
+}
+
+func (s *TimerSets) removes(vs []*TimerCell) {
+	s.m.Lock()
+	defer s.m.Unlock()
+	for _, cell := range vs {
+		if _, ok := s.sets[cell.id]; !ok {
+			log.Printf("[WARRING] 要移除的timer: %+v 不存在", cell)
+		}
+		delete(s.sets, cell.id)
+	}
 }
 
 func (s *TimerSets) find(id TimerID) (cell *TimerCell, ok bool) {
@@ -290,10 +274,96 @@ func ant() {
 	}
 }
 
-func syncdb(cell *TimerCell) {
-	// 同步到持久化部分, 若出现问题及时panic
+func emit(cell *TimerCell) {
+	_expired.Put(cell)
 }
 
-func emit(cell *TimerCell) {
-	// TODO: 将到期 cell 发送到 ringbuff 等待读取
+func dbadd(cell *TimerCell) bool {
+	// FIXME: 实现原子操作: 不存在才添加
+	c := _redis.Get()
+	defer c.Close()
+
+	if _, err := c.Do("HMSET", redis.Args{}.Add(cell.id).AddFlat(cell)...); err != nil {
+		log.Panicf("写入redis发生错误: %v", err)
+	}
+	return true
+}
+
+func dbremove(id TimerID) {
+	c := _redis.Get()
+	defer c.Close()
+
+	result, err := redis.Int(c.Do("DEL", id))
+	if err != nil {
+		log.Panicf("从redis删除数据时发生错误: %v", err)
+	}
+	if result == 0 {
+		log.Printf("[WARRING] 从数据库中删除 timer: %d 不存在\n", id)
+	}
+}
+
+func dbremoves(cells []*TimerCell) {
+	c := _redis.Get()
+	defer c.Close()
+
+	ids := make([]TimerID, 0, len(cells))
+	for i, cell := range cells {
+		ids[i] = cell.id
+	}
+	result, err := redis.Int(c.Do("DEL", ids))
+	if err != nil {
+		log.Panicf("从redis删除数据时发生错误: %v", err)
+	}
+	if result != len(ids) {
+		log.Printf("[WARRING] 要求删除的个数为: %d, 实际删除的个数为: %d", len(ids), result)
+	}
+}
+
+// 添加计时器
+func AddTimer(deadline int64, value string) (id TimerID, ok bool) {
+	d := time.Unix(deadline, 0)
+	if d.Before(time.Now()) {
+		return TimerID(0), false
+	}
+	cell := &TimerCell{
+		id:       TimerID(atomic.AddUint64(&_cellId, 1)),
+		deadline: time.Unix(deadline, 0),
+		index:    TimeIndex(deadline / TimelineRadix),
+		value:    value,
+	}
+	if !_pool.add(cell) {
+		log.Printf("[ERR] 添加计时器 %d 失败\n", cell.id)
+		return TimerID(0), false
+	}
+	dbadd(cell)
+	log.Printf("[INFO] 添加计时器 %d\n", cell.id)
+	_timeline.pushDirty(cell)
+	return cell.id, true
+}
+
+// 查找计时器是否存在, 若存在折该计时器还未触发
+func IsTimerAlive(id TimerID) bool {
+	_, ok := _pool.find(id)
+	return ok
+}
+
+// 移除计时器
+func RemoveTimer(id TimerID) {
+	if !_pool.remove(id) {
+		log.Printf("要移除的timer: %d 不存在", id)
+	}
+	dbremove(id)
+}
+
+// 获取到期计时器
+func GetExpiredTimer(limit uint32) []*TimerCell {
+	values, _ := _expired.Gets(limit)
+	cells := make([]*TimerCell, 0, len(values))
+	for i, v := range values {
+		cell := v.(*TimerCell)
+		cells[i] = cell
+	}
+	_pool.removes(cells)
+	dbremoves(cells)
+	return cells
 }

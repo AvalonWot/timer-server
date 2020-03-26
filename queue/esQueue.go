@@ -1,5 +1,5 @@
 // esQueue
-// 来自 https://github.com/yireyun/go-queue, 原始代码没有mod, 这里直接添加进来
+// 来自 https://github.com/yireyun/go-queue, 修复死锁bug
 package queue
 
 import (
@@ -200,7 +200,7 @@ func (q *EsQueue) Get() (val interface{}, ok bool, quantity uint32) {
 }
 
 // gets queue functions
-func (q *EsQueue) Gets(values []interface{}) (gets, quantity uint32) {
+func (q *EsQueue) Gets(limit uint32) (gets []interface{}, quantity uint32) {
 	var putPos, getPos, getPosNew, posCnt, getCnt uint32
 	capMod := q.capMod
 
@@ -215,11 +215,11 @@ func (q *EsQueue) Gets(values []interface{}) (gets, quantity uint32) {
 
 	if posCnt < 1 {
 		runtime.Gosched()
-		return 0, posCnt
+		return nil, posCnt
 	}
 
-	if size := uint32(len(values)); posCnt >= size {
-		getCnt = size
+	if posCnt >= limit {
+		getCnt = limit
 	} else {
 		getCnt = posCnt
 	}
@@ -227,9 +227,10 @@ func (q *EsQueue) Gets(values []interface{}) (gets, quantity uint32) {
 
 	if !atomic.CompareAndSwapUint32(&q.getPos, getPos, getPosNew) {
 		runtime.Gosched()
-		return 0, posCnt
+		return nil, posCnt
 	}
 
+	values := make([]interface{}, 0, getCnt)
 	for posNew, v := getPos+1, uint32(0); v < getCnt; posNew, v = posNew+1, v+1 {
 		var cache *esCache = &q.cache[posNew&capMod]
 		for {
@@ -246,7 +247,7 @@ func (q *EsQueue) Gets(values []interface{}) (gets, quantity uint32) {
 		}
 	}
 
-	return getCnt, posCnt - getCnt
+	return values, posCnt - getCnt
 }
 
 // round 到最近的2的倍数
