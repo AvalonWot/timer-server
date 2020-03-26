@@ -1,6 +1,7 @@
 package timer
 
 import (
+	"fmt"
 	"log"
 	"runtime"
 	"sort"
@@ -18,11 +19,12 @@ const (
 )
 
 var (
-	_cellId   uint64
-	_timeline TimeLine
-	_pool     TimerSets
-	_redis    *redis.Pool
-	_expired  = queue.NewQueue(1024 * 1024)
+	_cellId    uint64
+	_timeline  TimeLine
+	_pool      TimerSets
+	_redis     *redis.Pool
+	_expired   = queue.NewQueue(1024 * 1024)
+	_addscript = redis.NewScript(1, fmt.Sprintf("--%d\nif redis.call('exists', KEYS[1]) ~= 0 then return redis.status_reply('FAIL') else return redis.call('hmset', KEYS[1], unpack(ARGV)) end", time.Now().UnixNano()))
 )
 
 // 每个timer的唯一标识
@@ -70,9 +72,10 @@ type TimerCell struct {
 	value    string
 }
 
-type dbCell struct {
-	deadline int64  `redis:"deadline"`
-	value    string `redis:"value"`
+type Timer struct {
+	Id       TimerID `redis:"id"`
+	Deadline int64   `redis:"deadline"`
+	Value    string  `redis:"value"`
 }
 
 func Init(redisAddr string) {
@@ -89,7 +92,8 @@ func Init(redisAddr string) {
 			return c, err
 		},
 	}
-	recovery()
+	err := recovery()
+	log.Panicf("恢复数据发生错误: %v", err)
 }
 
 func recovery() error {
@@ -112,7 +116,7 @@ func recovery() error {
 			return err
 		}
 		for _, mid := range ids {
-			id, err := redis.Uint64(mid, nil)
+			_, err := redis.Uint64(mid, nil)
 			if err != nil {
 				log.Printf("[ERR] 无法解析db的id为TimerID: %v", mid)
 				return err
@@ -121,15 +125,15 @@ func recovery() error {
 			if err != nil {
 				return err
 			}
-			var dbc dbCell
-			if err := redis.ScanStruct(v, &dbc); err != nil {
+			var t Timer
+			if err := redis.ScanStruct(v, &t); err != nil {
 				return err
 			}
 			cell := &TimerCell{
-				id:       TimerID(id),
-				deadline: time.Unix(dbc.deadline, 0),
-				index:    TimeIndex(dbc.deadline / TimelineRadix),
-				value:    dbc.value,
+				id:       t.Id,
+				deadline: time.Unix(t.Deadline, 0),
+				index:    TimeIndex(t.Deadline / TimelineRadix),
+				value:    t.Value,
 			}
 			// 选取当前已有最大的timerid作为之后新timer的计数基准
 			if uint64(cell.id) > _cellId {
@@ -293,18 +297,22 @@ func emit(cell *TimerCell) {
 	_expired.Put(cell)
 }
 
-func dbadd(cell *TimerCell) bool {
+func dbadd(cell *TimerCell) {
 	// FIXME: 实现原子操作: 不存在才添加
 	c := _redis.Get()
 	defer c.Close()
-	dbc := &dbCell{
-		deadline: cell.deadline.Unix(),
-		value:    cell.value,
+	t := &Timer{
+		Id:       cell.id,
+		Deadline: cell.deadline.Unix(),
+		Value:    cell.value,
 	}
-	if _, err := c.Do("HMSET", redis.Args{}.Add(cell.id).AddFlat(dbc)...); err != nil {
+	r, err := redis.String(_addscript.Do(c, redis.Args{}.Add(cell.id).AddFlat(t)...))
+	if err != nil {
 		log.Panicf("写入redis发生错误: %v", err)
 	}
-	return true
+	if r != "OK" {
+		log.Panicf("[ERR] 数据库和pool发生冲突, pool中没有timer: %d, 但数据库含有", cell.id)
+	}
 }
 
 func dbremove(id TimerID) {
@@ -371,7 +379,7 @@ func RemoveTimer(id TimerID) {
 }
 
 // 获取到期计时器
-func GetExpiredTimer(limit uint32) []*TimerCell {
+func GetExpiredTimer(limit uint32) []*Timer {
 	values, _ := _expired.Gets(limit)
 	cells := make([]*TimerCell, 0, len(values))
 	for i, v := range values {
@@ -380,5 +388,13 @@ func GetExpiredTimer(limit uint32) []*TimerCell {
 	}
 	_pool.removes(cells)
 	dbremoves(cells)
-	return cells
+	timers := make([]*Timer, 0, len(cells))
+	for i, v := range cells {
+		timers[i] = &Timer{
+			Id:       v.id,
+			Deadline: v.deadline.Unix(),
+			Value:    v.value,
+		}
+	}
+	return timers
 }
