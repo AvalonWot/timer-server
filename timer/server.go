@@ -15,7 +15,7 @@ import (
 
 const (
 	// 在时间线上划分的间隔的基数, 单位是秒
-	TimelineRadix = 30
+	TimelineRadix = 2 * 60
 )
 
 var (
@@ -105,7 +105,7 @@ func recovery() error {
 	cache := make([]*TimerCell, 0, 10240)
 	iter := "0"
 	for {
-		reply, err := redis.Values(redis.DoWithTimeout(c, 5*time.Second, "SCAN", iter))
+		reply, err := redis.Values(redis.DoWithTimeout(c, 5*time.Second, "SCAN", iter, "MATCH", "timer:*"))
 		if err != nil {
 			return err
 		}
@@ -113,18 +113,13 @@ func recovery() error {
 		if err != nil {
 			return err
 		}
-		var ids []interface{}
-		ids, err = redis.Values(reply[1], nil)
+		var keys []interface{}
+		keys, err = redis.Values(reply[1], nil)
 		if err != nil {
 			return err
 		}
-		for _, mid := range ids {
-			_, err := redis.Uint64(mid, nil)
-			if err != nil {
-				log.Printf("[ERR] 无法解析db的id为TimerID: %v", mid)
-				return err
-			}
-			v, err := redis.Values(c.Do("HGETALL", mid))
+		for _, key := range keys {
+			v, err := redis.Values(c.Do("HGETALL", key))
 			if err != nil {
 				return err
 			}
@@ -298,14 +293,17 @@ func ant() {
 		if ok {
 			l := slice.sort()
 			for TimeIndex(time.Now().Unix()/TimelineRadix) < index || len(l) > 0 {
-				for i, cell := range l {
-					if cell.deadline.Before(time.Now()) {
-						emit(cell)
-					} else {
-						l = l[i:]
-						break
+				newi := func(timers TimerList) int {
+					for i, cell := range timers {
+						if cell.deadline.Before(time.Now()) {
+							emit(cell)
+						} else {
+							return i
+						}
 					}
-				}
+					return 0
+				}(l)
+				l = l[newi:]
 				_timeline.popDirty(dirty)
 				merge(index, dirty)
 				runtime.Gosched()
@@ -340,7 +338,7 @@ func dbadd(cell *TimerCell) {
 		Deadline: cell.deadline.Unix(),
 		Value:    cell.value,
 	}
-	r, err := redis.String(_addscript.Do(c, redis.Args{}.Add(cell.id).AddFlat(t)...))
+	r, err := redis.String(_addscript.Do(c, redis.Args{}.Add(fmt.Sprintf("timer:%d", cell.id)).AddFlat(t)...))
 	if err != nil {
 		log.Panicf("写入redis发生错误: %v", err)
 	}
@@ -353,7 +351,7 @@ func dbremove(id TimerID) {
 	c := _redis.Get()
 	defer c.Close()
 
-	result, err := redis.Int(c.Do("DEL", id))
+	result, err := redis.Int(c.Do("DEL", fmt.Sprintf("timer:%d", id)))
 	if err != nil {
 		log.Panicf("从redis删除数据时发生错误: %v", err)
 	}
@@ -366,16 +364,16 @@ func dbremoves(cells []*TimerCell) {
 	c := _redis.Get()
 	defer c.Close()
 
-	ids := make([]interface{}, len(cells))
+	keys := make([]interface{}, len(cells))
 	for i, cell := range cells {
-		ids[i] = cell.id
+		keys[i] = fmt.Sprintf("timer:%d", cell.id)
 	}
-	result, err := redis.Int(c.Do("DEL", ids...))
+	result, err := redis.Int(c.Do("DEL", keys...))
 	if err != nil {
 		log.Panicf("从redis删除数据时发生错误: %v", err)
 	}
-	if result != len(ids) {
-		log.Printf("[WARRING] 要求删除的个数为: %d, 实际删除的个数为: %d", len(ids), result)
+	if result != len(keys) {
+		log.Printf("[WARRING] 要求删除的个数为: %d, 实际删除的个数为: %d", len(keys), result)
 	}
 }
 

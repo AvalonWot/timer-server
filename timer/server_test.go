@@ -16,10 +16,9 @@ func TestAddTimer(t *testing.T) {
 	AddTimer(time.Now().Add(time.Duration(40)*time.Second).Unix(), fmt.Sprintf("test-del"))
 	// RemoveTimer(id)
 	time.Sleep(time.Second)
-	n := 0
-	for n < 10 {
+	dl := time.Now().Add(time.Duration(50) * time.Second)
+	for time.Now().Before(dl) {
 		timers := GetExpiredTimer(20)
-		n += len(timers)
 		for _, t := range timers {
 			log.Printf("task: %s 到期: %v\n", t.Value, time.Unix(t.Deadline, 0))
 		}
