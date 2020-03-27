@@ -15,7 +15,7 @@ import (
 
 const (
 	// 在时间线上划分的间隔的基数, 单位是秒
-	TimelineRadix = 2 * 60
+	TimelineRadix = 30
 )
 
 var (
@@ -70,6 +70,7 @@ type TimerCell struct {
 	deadline time.Time
 	index    TimeIndex
 	value    string
+	removed  int32
 }
 
 type Timer struct {
@@ -93,13 +94,15 @@ func Init(redisAddr string) {
 		},
 	}
 	err := recovery()
-	log.Panicf("恢复数据发生错误: %v", err)
+	if err != nil {
+		log.Panicf("恢复数据发生错误: %v", err)
+	}
 }
 
 func recovery() error {
 	c := _redis.Get()
 	defer c.Close()
-	cache := make(map[TimerID]*TimerCell, 1024*1024)
+	cache := make([]*TimerCell, 0, 10240)
 	iter := "0"
 	for {
 		reply, err := redis.Values(redis.DoWithTimeout(c, 5*time.Second, "SCAN", iter))
@@ -139,15 +142,16 @@ func recovery() error {
 			if uint64(cell.id) > _cellId {
 				_cellId = uint64(cell.id)
 			}
-			cache[cell.id] = cell
+			cache = append(cache, cell)
 		}
 		if iter == "0" {
 			break
 		}
 	}
 	log.Printf("[INFO] 读取到timer个数: %d", len(cache))
+	_pool.init(cache)
 	go ant()
-	go func(vs map[TimerID]*TimerCell) {
+	go func(vs []*TimerCell) {
 		for _, cell := range vs {
 			_timeline.pushDirty(cell)
 		}
@@ -156,7 +160,14 @@ func recovery() error {
 	return nil
 }
 
-// TODO:  init 部分一定要记得处理 _cellId 的初始值, 从当前 timers 中找到最大值+1
+func (s *TimerSets) init(values []*TimerCell) {
+	s.m.Lock()
+	defer s.m.Unlock()
+	s.sets = make(map[TimerID]*TimerCell, 1024*1024)
+	for _, c := range values {
+		s.sets[c.id] = c
+	}
+}
 
 func (s *TimerSets) add(cell *TimerCell) bool {
 	s.m.Lock()
@@ -172,7 +183,8 @@ func (s *TimerSets) add(cell *TimerCell) bool {
 func (s *TimerSets) remove(id TimerID) bool {
 	s.m.Lock()
 	defer s.m.Unlock()
-	if _, ok := s.sets[id]; ok {
+	if t, ok := s.sets[id]; ok {
+		t.flagRemoved()
 		delete(s.sets, id)
 		return true
 	}
@@ -226,6 +238,9 @@ func (t *TimeLine) popDirty(out map[TimerID]*TimerCell) {
 }
 
 func (t *TimeLine) getSliceAndDelete(index TimeIndex) (slice *TimeSlice, ok bool) {
+	if t.v == nil {
+		t.v = make(map[TimeIndex]*TimeSlice)
+	}
 	slice, ok = t.v[index]
 	if ok {
 		delete(t.v, index)
@@ -235,12 +250,27 @@ func (t *TimeLine) getSliceAndDelete(index TimeIndex) (slice *TimeSlice, ok bool
 
 // 将代理放入到对应的timeslice中
 func (t *TimeLine) putLine(cell *TimerCell) {
+	if t.v == nil {
+		t.v = make(map[TimeIndex]*TimeSlice)
+	}
 	slice, ok := t.v[cell.index]
 	if !ok {
 		slice = &TimeSlice{cell.index, make(map[TimerID]*TimerCell)}
 		t.v[cell.index] = slice
 	}
 	slice.v[cell.id] = cell
+}
+
+func (c *TimerCell) flagRemoved() {
+	atomic.AddInt32(&c.removed, 1)
+}
+
+func (c *TimerCell) isRemoved() bool {
+	if atomic.LoadInt32(&c.removed) == 1 {
+		return true
+	} else {
+		return false
+	}
 }
 
 // 将添加进来的timer(在dirty中的),合并到对应的slice中
@@ -261,7 +291,7 @@ func merge(index TimeIndex, dirty map[TimerID]*TimerCell) {
 }
 
 func ant() {
-	dirty := make(map[TimerID]*TimerCell)
+	dirty := make(map[TimerID]*TimerCell, 10240)
 	index := TimeIndex(time.Now().Unix() / TimelineRadix)
 	for {
 		slice, ok := _timeline.getSliceAndDelete(index)
@@ -294,7 +324,11 @@ func ant() {
 }
 
 func emit(cell *TimerCell) {
-	_expired.Put(cell)
+	if !cell.isRemoved() {
+		_expired.Put(cell)
+	} else {
+		log.Printf("[DEBUG] timer emit: %d 已经被移除", cell.id)
+	}
 }
 
 func dbadd(cell *TimerCell) {
@@ -332,11 +366,11 @@ func dbremoves(cells []*TimerCell) {
 	c := _redis.Get()
 	defer c.Close()
 
-	ids := make([]TimerID, 0, len(cells))
+	ids := make([]interface{}, len(cells))
 	for i, cell := range cells {
 		ids[i] = cell.id
 	}
-	result, err := redis.Int(c.Do("DEL", ids))
+	result, err := redis.Int(c.Do("DEL", ids...))
 	if err != nil {
 		log.Panicf("从redis删除数据时发生错误: %v", err)
 	}
@@ -372,6 +406,7 @@ func IsTimerAlive(id TimerID) bool {
 
 // 移除计时器
 func RemoveTimer(id TimerID) {
+	log.Printf("[INFO] 主动移除timer: %d", id)
 	if !_pool.remove(id) {
 		log.Printf("要移除的timer: %d 不存在", id)
 	}
@@ -381,20 +416,23 @@ func RemoveTimer(id TimerID) {
 // 获取到期计时器
 func GetExpiredTimer(limit uint32) []*Timer {
 	values, _ := _expired.Gets(limit)
-	cells := make([]*TimerCell, 0, len(values))
-	for i, v := range values {
-		cell := v.(*TimerCell)
-		cells[i] = cell
-	}
-	_pool.removes(cells)
-	dbremoves(cells)
-	timers := make([]*Timer, 0, len(cells))
-	for i, v := range cells {
-		timers[i] = &Timer{
-			Id:       v.id,
-			Deadline: v.deadline.Unix(),
-			Value:    v.value,
+	if len(values) > 0 {
+		cells := make([]*TimerCell, len(values))
+		for i, v := range values {
+			cell := v.(*TimerCell)
+			cells[i] = cell
 		}
+		_pool.removes(cells)
+		dbremoves(cells)
+		timers := make([]*Timer, len(cells))
+		for i, v := range cells {
+			timers[i] = &Timer{
+				Id:       v.id,
+				Deadline: v.deadline.Unix(),
+				Value:    v.value,
+			}
+		}
+		return timers
 	}
-	return timers
+	return nil
 }

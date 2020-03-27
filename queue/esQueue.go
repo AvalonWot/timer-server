@@ -230,7 +230,8 @@ func (q *EsQueue) Gets(limit uint32) (gets []interface{}, quantity uint32) {
 		return nil, posCnt
 	}
 
-	values := make([]interface{}, 0, getCnt)
+	fmt.Printf("getCnt : %d\n", getCnt)
+	values := make([]interface{}, getCnt)
 	for posNew, v := getPos+1, uint32(0); v < getCnt; posNew, v = posNew+1, v+1 {
 		var cache *esCache = &q.cache[posNew&capMod]
 		for {
