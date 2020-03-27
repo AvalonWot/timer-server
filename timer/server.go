@@ -301,7 +301,7 @@ func ant() {
 							return i
 						}
 					}
-					return 0
+					return len(timers)
 				}(l)
 				l = l[newi:]
 				_timeline.popDirty(dirty)
